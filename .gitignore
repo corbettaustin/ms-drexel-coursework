@@ -1,0 +1,34 @@
+# Large binaries
+*.zip
+*.mp4
+*.m4a
+*.mov
+
+# Non-code documents
+*.pdf
+*.pptx
+*.docx
+*.xlsx
+*.xls
+
+# R artifacts
+.Rhistory
+.RData
+.Rproj.user/
+
+# Python artifacts
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Large data files (>1MB handled by git, but exclude known large ones)
+modis_2024_all_countries.csv
+california_gdp_by_county_2001_2023.csv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Videos / recordings
+*.mkv
+*.avi

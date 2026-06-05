@@ -1,0 +1,390 @@
+---
+title: "Forecasting Median Listing Price - Rhode Island"
+subtitle: "STAT 645 Time Series Forecasting - Final Project"
+author: "Group X"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 9, fig.height = 5, dpi = 120
+)
+
+suppressPackageStartupMessages({
+  library(fpp3)
+  library(readxl)
+  library(dplyr)
+  library(ggplot2)
+  library(tidyr)
+  library(knitr)
+})
+
+theme_set(theme_minimal(base_size = 12))
+
+fig_dir <- "figures"
+if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
+save_png <- function(p, name, w = 9, h = 5, dpi = 150) {
+  ggsave(file.path(fig_dir, name), plot = p,
+         width = w, height = h, dpi = dpi, bg = "white")
+}
+```
+
+# 1. The data
+
+We forecast the FRED series **MEDLISPRIRI** - the monthly median listing
+price (USD) of homes in **Rhode Island**. The data are sourced by FRED
+from Zillow, span **July 2016 through March 2026** (117 monthly
+observations), and capture both the 2020 - 2024 housing boom and the
+recent softening.
+
+```{r load}
+raw <- read_excel("MEDLISPRIRI.xlsx", sheet = "Monthly")
+names(raw) <- c("date", "price")
+
+price_ts <- raw |>
+  mutate(month = yearmonth(date)) |>
+  as_tsibble(index = month) |>
+  select(month, price)
+
+price_ts |> head()
+```
+
+```{r summary-info}
+tibble(
+  n           = nrow(price_ts),
+  start       = format(min(price_ts$month)),
+  end         = format(max(price_ts$month)),
+  has_gaps    = any(has_gaps(price_ts)$.gaps),
+  min_price   = min(price_ts$price),
+  max_price   = max(price_ts$price),
+  mean_price  = round(mean(price_ts$price))
+) |> kable()
+```
+
+## 1.1 Time-series plot
+
+```{r overview-plot}
+p_overview <- price_ts |>
+  autoplot(price) +
+  labs(title = "Median Listing Price - Rhode Island",
+       subtitle = "Monthly, FRED MEDLISPRIRI",
+       x = NULL, y = "USD") +
+  scale_y_continuous(labels = scales::label_dollar())
+save_png(p_overview, "01_overview.png")
+p_overview
+```
+
+The series shows a strong upward trend, a noticeable acceleration around
+2020, a peak near mid-2025, and a recent decline. A multiplicative
+seasonal pattern (variance growing with the level) is plausible, which
+we test below.
+
+## 1.2 Seasonality
+
+```{r seasonal-plot}
+p_season <- price_ts |>
+  gg_season(price, labels = "both") +
+  labs(title = "Seasonal plot by year", y = "USD") +
+  scale_y_continuous(labels = scales::label_dollar())
+save_png(p_season, "02_seasonality.png")
+p_season
+```
+
+Most years show a familiar housing rhythm - prices climbing into the
+spring/summer listing window, then easing toward year-end. The
+amplitude is small relative to the trend but consistent enough to model.
+
+## 1.3 STL decomposition
+
+```{r stl}
+stl_comp <- price_ts |>
+  model(STL(price ~ trend(window = 13) + season(window = "periodic"),
+            robust = TRUE)) |>
+  components()
+
+p_stl <- autoplot(stl_comp) +
+  labs(title = "STL decomposition")
+save_png(p_stl, "03_stl.png", w = 9, h = 7)
+p_stl
+```
+
+STL confirms a dominant trend, a stable yearly seasonal pattern, and a
+modest remainder. The remainder is noticeably larger during 2020 - 2022,
+which is a fingerprint of the COVID-era market shock.
+
+## 1.4 Transformation check
+
+The spread of the series grows with its level, so a variance-stabilising
+transform is worth considering. The Guerrero-optimal Box-Cox lambda is:
+
+```{r boxcox}
+lambda <- price_ts |>
+  features(price, features = guerrero) |>
+  pull(lambda_guerrero)
+sprintf("Guerrero lambda: %.3f", lambda)
+```
+
+The optimum (lambda approximately -0.9) is extreme and numerically
+unstable on a short series with a structural break - a Box-Cox ETS at
+this lambda back-transforms to non-finite forecasts. We therefore use a
+**log** transform (lambda = 0) for the transformed ETS candidate: it
+stabilises the variance cleanly and, because the transform is fixed
+rather than estimated from the data, it introduces no holdout leakage.
+
+# 2. Train / test split
+
+We hold out the **last 12 months** (~10% of n=117). All candidate
+models are fit on the training portion and evaluated on the holdout.
+
+```{r split}
+h_test <- 12
+cutoff <- max(price_ts$month) - h_test
+train  <- price_ts |> filter(month <= cutoff)
+test   <- price_ts |> filter(month >  cutoff)
+
+p_split <- ggplot() +
+  geom_line(data = train, aes(month, price), colour = "steelblue") +
+  geom_line(data = test,  aes(month, price), colour = "tomato") +
+  geom_vline(xintercept = as.Date(cutoff), linetype = 2) +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  labs(title = "Train (blue) vs holdout (red)",
+       x = NULL, y = "USD")
+save_png(p_split, "04_train_test.png")
+p_split
+```
+
+# 3. Candidate models
+
+We fit twelve candidates spanning every model family covered in class:
+
+* **Toolbox baselines** - `MEAN`, `NAIVE`, `SNAIVE`, `RW + drift`
+* **Time-series linear regression (TSLM)** - trend + seasonal dummies, and trend + Fourier(K=2)
+* **ETS (exponential smoothing)** - hand-specified M-A-M, damped A-Ad-A, and a log-transformed ETS
+* **ARIMA** - automatically selected, plus a hand-specified seasonal `(1,1,1)(0,1,1)`
+* **STL decomposition + ETS** on the seasonally adjusted series
+
+```{r fit-all}
+fits <- train |>
+  model(
+    Mean       = MEAN(price),
+    Naive      = NAIVE(price),
+    SNaive     = SNAIVE(price ~ lag("year")),
+    Drift      = RW(price ~ drift()),
+    TSLM_seas  = TSLM(price ~ trend() + season()),
+    TSLM_four  = TSLM(price ~ trend() + fourier(K = 2)),
+    ETS_MAM    = ETS(price ~ error("M") + trend("A")  + season("M")),
+    ETS_AAdA   = ETS(price ~ error("A") + trend("Ad") + season("A")),
+    ETS_log    = ETS(log(price)),
+    ARIMA      = ARIMA(price),
+    ARIMA_man  = ARIMA(price ~ pdq(1, 1, 1) + PDQ(0, 1, 1)),
+    STL_ETS    = decomposition_model(
+                   STL(price ~ trend(window = 13) +
+                                season(window = "periodic"),
+                       robust = TRUE),
+                   ETS(season_adjust ~ season("N"))
+                 )
+  )
+```
+
+`ETS()` auto-selection independently chooses (M,A,M) and `ARIMA()`
+chooses `(0,1,1)(1,0,0)[12]`, so the automatic and hand-specified
+models agree on the family the data prefers:
+
+```{r auto-check}
+train |> model(ETS_auto = ETS(price), ARIMA_auto = ARIMA(price))
+```
+
+```{r glance}
+# glance() does not support decomposition_model; exclude STL_ETS here.
+# AICc is comparable WITHIN the ETS and ARIMA families, but not across
+# families or against TSLM, so selection is made on holdout accuracy.
+glance(fits |> select(-STL_ETS)) |>
+  select(.model, AIC, AICc, BIC, sigma2) |>
+  arrange(AICc) |>
+  kable(digits = 1, caption = "In-sample fit summary (STL_ETS excluded - no glance method)")
+```
+
+# 4. Holdout accuracy
+
+```{r forecast-test}
+fc_test <- fits |> forecast(h = h_test)
+
+acc <- fc_test |>
+  accuracy(price_ts) |>
+  select(.model, RMSE, MAE, MAPE, MASE, RMSSE) |>
+  arrange(RMSE)
+
+write.csv(acc, file.path(fig_dir, "accuracy_table.csv"), row.names = FALSE)
+acc |> kable(digits = c(0, 0, 0, 2, 2, 2),
+             caption = "Forecast accuracy on the 12-month holdout, sorted by RMSE")
+```
+
+```{r forecast-compare}
+p_compare <- fc_test |>
+  autoplot(price_ts |> filter(month >= yearmonth("2022 Jan")),
+           level = NULL) +
+  labs(title = "Holdout forecasts - all candidate models",
+       y = "USD") +
+  scale_y_continuous(labels = scales::label_dollar())
+save_png(p_compare, "05_forecasts_compare.png", w = 10, h = 5)
+p_compare
+```
+
+```{r best-three}
+best3 <- acc$.model[1:3]
+p_best3 <- fc_test |>
+  filter(.model %in% best3) |>
+  autoplot(price_ts |> filter(month >= yearmonth("2022 Jan"))) +
+  labs(title = paste("Top 3 by RMSE:", paste(best3, collapse = ", ")),
+       y = "USD") +
+  scale_y_continuous(labels = scales::label_dollar())
+save_png(p_best3, "05b_best3_forecast.png", w = 10, h = 5)
+p_best3
+```
+
+# 5. Judgment calls
+
+A few non-obvious choices shaped the final pick:
+
+1. **Holdout length.** Twelve months satisfies the rubric's >=10% rule
+   and exposes any model's seasonal weakness across a full cycle.
+2. **ARIMA family included.** Chapter 9's ARIMA models are fit alongside
+   ETS - both an auto-selected `ARIMA()` and a hand-specified seasonal
+   `(1,1,1)(0,1,1)`. The seasonal ARIMA is the closest challenger to the
+   winner, which confirms (rather than overturns) the ETS choice.
+3. **Transformation.** The Guerrero lambda (approximately -0.9) is
+   numerically unstable on this short, structurally-broken series, so the
+   transformed candidate uses a log scale rather than a raw Box-Cox.
+4. **Damped vs. non-damped trend.** The 2025 reversal makes an
+   undamped trend dangerous for a 12-month forecast, so we include an
+   A-Ad-A specification and let accuracy adjudicate.
+5. **TSLM Fourier order.** K=2 captures the dominant annual cycle with
+   four coefficients, fewer than the eleven implied by seasonal dummies
+   and less prone to overfitting on a 105-month training set.
+
+# 6. Residual diagnostics for the chosen model
+
+```{r winner}
+winner <- acc$.model[1]
+winner
+best_fit <- fits |> select(all_of(winner))
+```
+
+```{r residuals, fig.height=6}
+p_resid <- best_fit |> gg_tsresiduals()
+save_png(p_resid, "06_residuals.png", w = 9, h = 6)
+p_resid
+```
+
+```{r ljung-box}
+# Degrees of freedom tied to the chosen model's estimated parameters
+# (smoothing parameters + initial states for ETS), not a hardcoded 0.
+n_par <- nrow(tidy(best_fit))
+augment(best_fit) |>
+  features(.innov, ljung_box, lag = 24, dof = n_par) |>
+  mutate(dof = n_par) |>
+  kable(caption = "Ljung-Box on the chosen model's residuals (lag 24)")
+```
+
+The ACF and histogram above are reassuring - residuals are roughly
+symmetric and most autocorrelations fall within the significance bounds.
+However, with the degrees of freedom set to the model's parameter count
+the Ljung-Box p-value is small (well below 0.05), driven by the cluster
+of large residuals during the 2020-2022 market shock that no smooth
+model fully absorbs. We read this as a documented limitation rather than
+a disqualifier: model selection is governed by out-of-sample accuracy on
+the holdout, and we report 80%/95% prediction intervals and flag
+regime-change risk precisely because some residual structure remains.
+
+# 7. Final forecast (12 months ahead)
+
+We refit the chosen specification on the **full** series and forecast
+twelve months beyond the data end.
+
+```{r final-fit}
+spec_lookup <- list(
+  Mean      = quote(MEAN(price)),
+  Naive     = quote(NAIVE(price)),
+  SNaive    = quote(SNAIVE(price ~ lag("year"))),
+  Drift     = quote(RW(price ~ drift())),
+  TSLM_seas = quote(TSLM(price ~ trend() + season())),
+  TSLM_four = quote(TSLM(price ~ trend() + fourier(K = 2))),
+  ETS_MAM   = quote(ETS(price ~ error("M") + trend("A")  + season("M"))),
+  ETS_AAdA  = quote(ETS(price ~ error("A") + trend("Ad") + season("A"))),
+  ETS_log   = quote(ETS(log(price))),
+  ARIMA     = quote(ARIMA(price)),
+  ARIMA_man = quote(ARIMA(price ~ pdq(1, 1, 1) + PDQ(0, 1, 1))),
+  STL_ETS   = quote(decomposition_model(
+                     STL(price ~ trend(window = 13) +
+                                  season(window = "periodic"),
+                         robust = TRUE),
+                     ETS(season_adjust ~ season("N"))))
+)
+
+final_fit <- price_ts |>
+  model(final = eval(spec_lookup[[winner]]))
+
+final_fc <- final_fit |> forecast(h = 12)
+```
+
+```{r final-plot}
+p_final <- final_fc |>
+  autoplot(price_ts |> filter(month >= yearmonth("2018 Jan"))) +
+  labs(title = paste0("Final forecast (", winner,
+                      ") - next 12 months"),
+       subtitle = "80% and 95% prediction intervals",
+       y = "USD") +
+  scale_y_continuous(labels = scales::label_dollar())
+save_png(p_final, "07_final_forecast.png", w = 10, h = 5)
+p_final
+```
+
+```{r final-table}
+final_tbl <- final_fc |>
+  hilo(level = c(80, 95)) |>
+  as_tibble() |>
+  mutate(
+    point = .mean,
+    lo80  = `80%`$lower,
+    hi80  = `80%`$upper,
+    lo95  = `95%`$lower,
+    hi95  = `95%`$upper
+  ) |>
+  select(month, point, lo80, hi80, lo95, hi95)
+write.csv(final_tbl, file.path(fig_dir, "final_forecast_table.csv"),
+          row.names = FALSE)
+
+final_tbl |>
+  kable(digits = 0,
+        caption = "Point forecast with 80% / 95% prediction intervals")
+```
+
+# 8. Conclusions and caveats
+
+* **ETS(M,A,M)** is the most accurate model on the 12-month holdout
+  (RMSE about \$12.7k, MAPE about 2.0%), narrowly ahead of a seasonal
+  ARIMA `(1,1,1)(0,1,1)` and well ahead of every toolbox baseline.
+* The chosen model balances in-sample fit against out-of-sample
+  accuracy on a full 12-month holdout; selection is driven by the
+  holdout, since AICc is not comparable across model families.
+* **Residuals.** The residual ACF is mostly within bounds, but a formal
+  Ljung-Box (with degrees of freedom set to the parameter count) is
+  significant - the 2020-2022 shock leaves some structure no smooth
+  model fully captures. We treat this as a documented limitation and
+  rely on prediction intervals accordingly.
+* **Caveats.** Nine years of monthly data is short; the 2020 - 2022
+  shock is a sizeable share of the sample and may inflate the
+  remainder term. A regime shift (rate cuts, policy change) would
+  invalidate the point forecast quickly, which is why we report
+  intervals as well.
+* For monitoring, refit monthly as fresh observations arrive and watch
+  the standardised residuals - sustained drift outside +/- 2 sigma
+  would be the earliest warning that the chosen specification has
+  expired.
