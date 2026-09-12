@@ -1,6 +1,6 @@
 # MS Business Analytics — Drexel University
 
-Graduate coursework in data science, machine learning, statistics, and business analytics. All code is my own work from homework assignments, quizzes, exams, and course projects.
+Graduate coursework in data science, machine learning, statistics, and business analytics. This repository contains my coursework files and project contributions; several projects were team-based, and individual contributions are described in their dedicated repositories.
 
 **Program:** MS in Business Analytics  
 **School:** Drexel University, LeBow College of Business  
